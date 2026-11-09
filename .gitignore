@@ -21,4 +21,4 @@ pgdata/
 *.log
 
 # Except requirements.txt
-!requirements.txt
+!requirements.txt*.txt
