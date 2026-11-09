@@ -1,0 +1,24 @@
+# Environment Variables (NEVER PUSH SECRETS)
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+.txt/
+# Data Lake (Too big for Git)
+data_lake/*
+!data_lake/.gitkeep
+
+# Postgres / Docker local volumes
+pgdata/
+
+# Langfuse / Logs
+*.log
+
+# Except requirements.txt
+!requirements.txt

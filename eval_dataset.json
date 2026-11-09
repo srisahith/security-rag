@@ -1,0 +1,20 @@
+[
+  {
+    "question": "What is the Log4j vulnerability?",
+    "source_filter": "cisa",
+    "expected_context_keyword": "Log4j",
+    "ground_truth": "Log4j is a critical remote code execution vulnerability in Apache Log4j."
+  },
+  {
+    "question": "What are the latest ransomware attacks?",
+    "source_filter": "hackernews",
+    "expected_context_keyword": "ransomware",
+    "ground_truth": "Recent news about ransomware groups targeting enterprise networks."
+  },
+  {
+    "question": "How do I prevent SQL injection?",
+    "source_filter": "owasp",
+    "expected_context_keyword": "injection",
+    "ground_truth": "Use parameterized queries and input validation to prevent SQL injection."
+  }
+]

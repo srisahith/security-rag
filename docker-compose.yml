@@ -1,0 +1,89 @@
+services:
+  # 1. The PostgreSQL Database
+  db:
+    image: ankane/pgvector:latest
+    container_name: aegis_db
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # 2. The Redis Event Bus & Cache
+  redis:
+    image: redis:alpine
+    container_name: aegis_redis
+    ports:
+      - "6379:6379"
+
+  # 3. Your FastAPI Backend
+  api:
+    build: .
+    container_name: aegis_api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # 4. Celery Worker (For IRIS & DAST Background Jobs)
+  worker:
+    build: .
+    container_name: aegis_worker
+    command: celery -A app.workers.celery_app worker --loglevel=info
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+      - redis
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # 5. The Vulnerable Target App for DAST to scan
+  juice-shop:
+    image: bkimminich/juice-shop
+    container_name: aegis_target
+    ports:
+      - "3000:3000"
+  
+  prometheus:
+    image: prom/prometheus
+    container_name: aegis_prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana
+    container_name: aegis_grafana
+    ports:
+      - "3002:3000"
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: aegis_langfuse
+    ports:
+      - "3001:3000"
+    environment:
+      - DATABASE_URL=postgresql://admin:supersecretpassword@db:5432/langfuse
+      - NEXTAUTH_SECRET=mysecret
+      - SALT=mysalt
+      - NEXTAUTH_URL=http://localhost:3001
+    depends_on:
+      - db
+
+# This volume is for the database
+volumes:
+  pgdata:
