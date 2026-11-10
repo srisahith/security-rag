@@ -191,15 +191,12 @@ def agentic_workflow(request: Request, rag_request: RAGRequest, current_user: st
     }
     
     try:
-        # 🚨 Invoke the LangGraph Orchestrator
         result = agent_graph.invoke(initial_state)
-        
-        trace.span(
-            name="LangGraph_Execution", 
-            output=result["final_answer"][:500]
-        ).end()
-        
+        trace.span(name="LangGraph_Execution", output=result["final_answer"][:500]).end()
     except Exception as e:
+        # 🚨 Print the full traceback
+        import traceback
+        traceback.print_exc()
         trace.update(level="ERROR", status_message=str(e))
         raise HTTPException(status_code=500, detail=f"Graph error: {e}")
     

@@ -5,12 +5,18 @@ import os
 client = Client(host=os.getenv("OLLAMA_URL", "http://host.docker.internal:11434"))
 
 def triage_agent(question: str):
+    """
+    LLM-based intent classification.
+    Returns a JSON dict: {"needs_search": bool, "needs_remediation": bool}
+    """
     prompt = f"""You are a SOC Triage Agent. Analyze this user question: "{question}"
     
-    RULES:
-    1. If the user asks about ANY vulnerability, CVE, VDB, vendor, product, or threat intel, you MUST set needs_search to true.
-    2. If the user asks for a fix, patch, remediation, mitigation, or "how to fix", you MUST set needs_remediation to true.
-    3. If the question contains an ID like CVE-2024-1234 or VDB-249838, set both needs_search and needs_remediation to true.
+    DEFAULT POLICY:
+    - ALWAYS set needs_remediation to true.
+    - ONLY set needs_remediation to false if the user EXPLICITLY says they do NOT want a fix (e.g., "just tell me what it is", "no fix needed", "don't give me remediation").
+    
+    SEARCH POLICY:
+    - Set needs_search to true for ANY question about a vulnerability, CVE, VDB, or threat.
     
     Reply ONLY with valid JSON:
     {{"needs_search": true/false, "needs_remediation": true/false}}"""
@@ -23,5 +29,6 @@ def triage_agent(question: str):
         )
         return json.loads(response['message']['content'])
     except Exception as e:
-        print(f"[TRIAGE ERROR] {e}")
-        return {"needs_search": True, "needs_remediation": True} # Fallback: do both
+        print(f"[TRIAGE AGENT ERROR] {e}")
+        # Fallback: always do both
+        return {"needs_search": True, "needs_remediation": True}

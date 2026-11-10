@@ -1,34 +1,73 @@
-# 🛡️ Security-RAG: Enterprise AI Threat Intelligence Platform
+# 🛡️ Aegis-Sentinel: Multi-Agent MCP Threat Intelligence Platform
 
-An advanced, locally-hosted **Hybrid Retrieval-Augmented Generation (RAG)** pipeline designed for Cyber Security Operations Centers (SOC). This platform ingests live threat intelligence, performs hybrid search (Vector + Keyword), and generates accurate, hallucination-free answers for security analysts.
+An advanced, locally-hosted **Multi-Agent RAG Platform** designed for Cyber Security Operations Centers (SOC). Built with **LangGraph Orchestration**, **Model Context Protocol (MCP)**, and **Hybrid Search (pgvector)**, this system triages user intent, retrieves threat intel via a decoupled MCP Server, and generates actionable remediation plans using local LLMs.
 
-Built to run entirely on consumer hardware (tested on a 16GB RAM laptop with an RTX 3050 6GB GPU) using local LLMs.
+Built to run entirely on consumer hardware (tested on a 16GB RAM laptop with an RTX 3050 6GB GPU).
 
 ## 🚀 Key Features
 
-*   **Hybrid Search Architecture:** Combines `pgvector` (HNSW) for semantic search with PostgreSQL `tsvector` (GIN Inverted Index) for exact keyword matching (e.g., precise CVE IDs).
-*   **Multi-Source Data Ingestion:** Scrapes and ingests live data from CISA KEV, NVD, Hacker News, BleepingComputer, Krebs on Security, Cisco Talos, and Unit 42.
-*   **Intelligent Chunking:** Uses Structure-Aware Chunking for NVD JSON feeds (1 CVE = 1 Chunk) and Contextual Enrichment (prepending CVE IDs and source metadata before embedding).
-*   **Reranking:** Utilizes FlashRank (Cross-Encoder) to re-order retrieved chunks for maximum precision before sending to the LLM.
-*   **High-Performance Caching:** Integrates Redis to cache frequent queries, reducing response times from ~6 seconds to <10 milliseconds.
-*   **Asynchronous Ingestion:** Uses Celery and Redis to process massive NVD feeds in the background without blocking the API.
-*   **Full Observability:** Prometheus metrics for system health (p50/p99 latency) and Langfuse for AI tracing (prompt/response debugging).
-*   **Local & Private:** Runs entirely on a local GPU using Ollama (`qwen2.5:1.5b` and `nomic-embed-text`), ensuring sensitive threat data never leaves the machine.
+*   **Loose-Coupled MCP Architecture:** The database is exposed as a standardized MCP Tool, decoupling the AI agents from the SQL layer.
+*   **LangGraph Orchestration:** A state machine (Triage → Threat Intel → Remediation → Finalize) manages the agent workflow with deterministic guardrails.
+*   **Hybrid Search:** Combines `pgvector` (HNSW) for semantic search with PostgreSQL `tsvector` (GIN) for exact CVE/VDB matching.
+*   **Multi-Source Ingestion:** Scrapes live data from CISA, NVD, Hacker News, BleepingComputer, Krebs, Cisco Talos, and Unit 42.
+*   **Intelligent Chunking:** Structure-aware chunking with contextual enrichment (prepending CVE IDs before embedding) and recursive fallbacks.
+*   **Reranking:** Utilizes FlashRank to re-order retrieved chunks for maximum precision.
+*   **High-Performance Caching:** Redis caches frequent queries, reducing response times from ~6s to <10ms.
+*   **Full Observability:** Prometheus (system metrics) and Langfuse (AI tracing/prompt debugging).
+*   **Secure by Design:** JWT Authentication, Rate Limiting (SlowAPI), and Deterministic Guardrails.
 
-## 🏗️ Architecture
+## 🏗️ Architecture Diagram
 
 ```text
-[ User / Swagger UI ]
-         │
-         ▼
-[ FastAPI Gateway ] 
-         │
-         ├──> [ Redis Cache ] (Semantic Caching)
-         │
-         ├──> [ Celery Worker ] (Background Ingestion)
-         │
-         └──> [ Hybrid RAG Pipeline ]
-                   │
-                   ├──> [ PostgreSQL + pgvector ] (HNSW + GIN Index)
-                   │
-                   └──> [ Ollama (RTX 3050) ] (qwen2.5 & nomic-embed-text)
+┌─────────────────────────────────────────────────────────────────────┐
+│                        WINDOWS HOST (GPU)                           │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                    Ollama (RTX 3050 6GB)                      │  │
+│  │   ┌─────────────────────┐    ┌────────────────────────────┐   │  │
+│  │   │ qwen2.5:1.5b        │    │ nomic-embed-text           │   │  │
+│  │   │ (Reasoning/Agents)  │    │ (Embeddings for RAG)       │   │  │
+│  │   └─────────────────────┘    └────────────────────────────┘   │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+                              ▲
+                              │ HTTP (host.docker.internal:11434)
+                              │
+┌─────────────────────────────┼───────────────────────────────────────┐
+│                    DOCKER NETWORK (WSL2)                            │
+│                                                                     │
+│  ┌──────────────┐     ┌──────────────────────────────────────────┐  │
+│  │  Streamlit   │────▶│           FastAPI Gateway                │  │
+│  │  UI (8501)   │     │  (JWT Auth, Rate Limit, Prometheus)      │  │
+│  └──────────────┘     └──────────────────┬───────────────────────┘  │
+│                                          │                          │
+│                                          ▼                          │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │              LangGraph Orchestrator (State Machine)           │  │
+│  │   ┌──────────┐    ┌──────────────┐    ┌──────────────────┐   │  │
+│  │   │  Triage  │───▶│ Threat Intel │───▶│   Remediation    │   │  │
+│  │   │  Agent   │    │   (MCP)      │    │     Agent        │   │  │
+│  │   └──────────┘    └──────┬───────┘    └──────────────────┘   │  │
+│  │        │                 │                    │              │  │
+│  │        ▼                 ▼                    ▼              │  │
+│  │   Guardrails       MCP Client           qwen2.5 LLM         │  │
+│  └───────────────────────────┼──────────────────────────────────┘  │
+│                              │ stdio (spawns subprocess)            │
+│                              ▼                                      │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │              MCP Server (Standalone Process)                 │  │
+│  │   Tool: search_cve(question) → SQL + Embedding + HNSW        │  │
+│  └───────────────────────────┬──────────────────────────────────┘  │
+│                              │                                      │
+│         ┌────────────────────┼────────────────────┐                 │
+│         ▼                    ▼                    ▼                 │
+│  ┌────────────┐      ┌────────────┐      ┌────────────┐             │
+│  │ PostgreSQL │      │   Redis    │      │  Langfuse  │             │
+│  │ + pgvector │      │  (Cache +  │      │ (AI Tracing│             │
+│  │ (HNSW+GIN) │      │  Pub/Sub)  │      │  & Evals)  │             │
+│  └────────────┘      └────────────┘      └────────────┘             │
+│                                                                     │
+│  ┌────────────┐      ┌────────────┐      ┌────────────┐             │
+│  │ Prometheus │      │  Grafana   │      │   Celery   │             │
+│  │ (Metrics)  │      │ (Dashboard)│      │  (Worker)  │             │
+│  └────────────┘      └────────────┘      └────────────┘             │
+└─────────────────────────────────────────────────────────────────────┘

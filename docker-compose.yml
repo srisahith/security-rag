@@ -83,7 +83,20 @@ services:
       - NEXTAUTH_URL=http://localhost:3001
     depends_on:
       - db
-
+  ui:
+    image: python:3.11-slim
+    container_name: aegis_ui
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: >
+      sh -c "pip install streamlit httpx && streamlit run app/ui.py --server.port=8501 --server.address=0.0.0.0"
+    ports:
+      - "8501:8501"
+    environment:
+      - API_URL=http://api:8000
+    depends_on:
+      - api
 # This volume is for the database
 volumes:
   pgdata:
