@@ -20,9 +20,11 @@ from datetime import datetime, timedelta
 from prometheus_fastapi_instrumentator import Instrumentator
 from langfuse import Langfuse
 from app.workers import process_data_lake_task
-from app.agents.soc_agents import triage_agent, remediation_agent
 
-# --- 2. SETUP ---
+# 🚨 2. IMPORT THE LANGGRAPH ORCHESTRATOR
+from app.graph.workflow import agent_graph
+
+# --- 3. SETUP ---
 SECRET_KEY = "super-secret-aegis-key-change-in-prod"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
@@ -31,12 +33,15 @@ app = FastAPI(title="Aegis-Sentinel API")
 Instrumentator().instrument(app).expose(app)
 langfuse = Langfuse()
 
+# Rate Limiter
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# Redis Cache
 redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"))
 
+# Auth Setup
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/token")
 
@@ -53,13 +58,13 @@ OLLAMA_HOST = os.getenv("OLLAMA_URL", "http://host.docker.internal:11434")
 client = Client(host=OLLAMA_HOST)
 ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="/tmp")
 
-# --- 3. REQUEST MODELS ---
+# --- 4. REQUEST MODELS ---
 class RAGRequest(BaseModel):
     question: str
     source_filter: str | None = None
     days_back: int | None = None
 
-# --- 4. AUTH HELPERS ---
+# --- 5. AUTH HELPERS (MUST BE BEFORE ROUTES) ---
 def verify_password(plain_password, stored_password):
     return plain_password == stored_password
 
@@ -83,7 +88,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     except JWTError:
         raise credentials_exception
 
-# --- 5. ENDPOINTS ---
+# --- 6. ENDPOINTS ---
 
 @app.post("/api/token")
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
@@ -101,6 +106,7 @@ def trigger_ingestion(current_user: str = Depends(get_current_user)):
 @app.post("/api/ask")
 @limiter.limit("10/minute")
 def ask_threat_intel(request: Request, rag_request: RAGRequest, current_user: str = Depends(get_current_user)):
+    """Standard RAG endpoint (No Agents). Direct DB + LLM."""
     cache_key = f"rag:{rag_request.question}:{rag_request.source_filter}:{rag_request.days_back}"
     cached_result = redis_client.get(cache_key)
     if cached_result:
@@ -112,10 +118,9 @@ def ask_threat_intel(request: Request, rag_request: RAGRequest, current_user: st
     register_vector(conn)
     
     try:
-        # 🚨 1. CLEAN THE QUERY (Remove fluff, keep alphanumeric and hyphens)
+        # Clean the query
         clean_query = re.sub(r'[^A-Za-z0-9\-]', ' ', rag_request.question).strip()
         
-        # 🚨 2. BUILD SQL
         sql_query = "SELECT content FROM lake_children WHERE 1=1"
         params = []
         
@@ -123,15 +128,10 @@ def ask_threat_intel(request: Request, rag_request: RAGRequest, current_user: st
             sql_query += " AND source = %s "
             params.append(rag_request.source_filter)
             
-        if rag_request.days_back:
-            sql_query += f" AND created_at >= NOW() - INTERVAL '{rag_request.days_back} days' "
-            
-        # 🚨 3. EXACT MATCH BYPASS (If the query has a hyphen and a number, it's an ID)
         if "-" in clean_query and any(char.isdigit() for char in clean_query):
             sql_query += " AND content ILIKE %s "
             params.append(f"%{clean_query}%")
             
-        # 🚨 4. Add Vector Search as fallback
         query_embedding = client.embeddings(model="nomic-embed-text", prompt=rag_request.question)["embedding"]
         sql_query += " ORDER BY embedding <=> %s::vector LIMIT 3;"
         params.append(query_embedding)
@@ -150,7 +150,6 @@ def ask_threat_intel(request: Request, rag_request: RAGRequest, current_user: st
         cur.close()
         conn.close()
 
-    # 5. LLM Reasoning
     system_prompt = f"""You are a Cyber Security AI. Answer using ONLY this context: {context}"""
     try:
         response = client.chat(
@@ -171,95 +170,52 @@ def ask_threat_intel(request: Request, rag_request: RAGRequest, current_user: st
     langfuse.flush()
     return response_data
 
+# 🚨 7. THE NEW LANGGRAPH MULTI-AGENT ENDPOINT
 @app.post("/api/agent")
 @limiter.limit("5/minute")
 def agentic_workflow(request: Request, rag_request: RAGRequest, current_user: str = Depends(get_current_user)):
+    """
+    Invokes the LangGraph state machine.
+    The graph handles Triage -> MCP Search -> Remediation.
+    """
     trace = langfuse.trace(name="Multi_Agent_Workflow", input={"question": rag_request.question})
     
-    # 1. Triage Agent
-    decision = triage_agent(rag_request.question)
-    print(f"[AGENT] Triage Decision: {decision}")
-    trace.span(name="Triage_Agent", output=json.dumps(decision)).end()
+    # Initialize the State
+    initial_state = {
+        "question": rag_request.question,
+        "needs_search": False,
+        "needs_remediation": False,
+        "context": "",
+        "remediation_plan": "",
+        "final_answer": ""
+    }
     
-    context = "No threat intel requested."
-    remediation_plan = "No remediation requested."
-    
-    # 2. Threat Intel Agent (SQL Search)
-        # 2. Threat Intel Agent (SQL Search)
-        # 2. Threat Intel Agent (SQL Search)
-    if decision.get("needs_search", True):
-        print(f"[AGENT] Performing SQL search for: {rag_request.question}")
-        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
-        cur = conn.cursor()
-        register_vector(conn)
-        try:
-            # 🚨 1. Extract just the ID using a simple split
-            # This handles "what is VDB-249838" -> "VDB-249838"
-            clean_query = ""
-            for word in rag_request.question.split():
-                if "-" in word and any(char.isdigit() for char in word):
-                    clean_query = word.strip("?.,;:")
-                    break
-            
-            if not clean_query:
-                # If no ID found, just use the whole question for vector search
-                clean_query = rag_request.question
-                
-            print(f"[AGENT] Clean query: {clean_query}")
-            
-            # 🚨 2. Build the SQL
-            sql_query = "SELECT content FROM lake_children WHERE 1=1"
-            params = []
-            
-            if rag_request.source_filter:
-                sql_query += " AND source = %s "
-                params.append(rag_request.source_filter)
-                
-            # 🚨 3. If it looks like an ID, force the exact match
-            if "-" in clean_query and any(char.isdigit() for char in clean_query):
-                sql_query += " AND content ILIKE %s "
-                params.append(f"%{clean_query}%")
-                print(f"[AGENT] Added ILIKE filter: %{clean_query}%")
-                
-            # 🚨 4. Add the vector search
-            query_embedding = client.embeddings(model="nomic-embed-text", prompt=rag_request.question)["embedding"]
-            sql_query += " ORDER BY embedding <=> %s::vector LIMIT 3;"
-            params.append(query_embedding)
-            
-            print(f"[AGENT] SQL: {sql_query}")
-            cur.execute(sql_query, tuple(params))
-            results = cur.fetchall()
-            print(f"[AGENT] Found {len(results)} results.")
-            
-            if results:
-                context = "\n\n---\n\n".join([row[0] for row in results])
-            else:
-                context = "No results found in database for this query."
-                
-        except Exception as e:
-            print(f"[AGENT ERROR] {e}")
-            context = f"Database error: {e}"
-        finally:
-            cur.close()
-            conn.close()
-    # 3. Remediation Agent
-    if decision.get("needs_remediation", False) and context != "No threat intel requested.":
-        remediation_plan = remediation_agent(context)
-        trace.span(name="Remediation_Agent", output=remediation_plan[:500]).end()
-
-    # 4. Final Synthesis
-    final_answer = f"### Threat Intel Analysis\n{context}\n\n### Remediation Plan\n{remediation_plan}"
+    try:
+        # 🚨 Invoke the LangGraph Orchestrator
+        result = agent_graph.invoke(initial_state)
+        
+        trace.span(
+            name="LangGraph_Execution", 
+            output=result["final_answer"][:500]
+        ).end()
+        
+    except Exception as e:
+        trace.update(level="ERROR", status_message=str(e))
+        raise HTTPException(status_code=500, detail=f"Graph error: {e}")
     
     langfuse.flush()
     
     return {
         "question": rag_request.question,
-        "triage_decision": decision,
-        "context_snippet": context[:300] + "...",
-        "remediation_plan": remediation_plan,
-        "ai_answer": final_answer
+        "triage_decision": {
+            "needs_search": result["needs_search"],
+            "needs_remediation": result["needs_remediation"]
+        },
+        "context_snippet": result["context"][:300] + "...",
+        "remediation_plan": result["remediation_plan"],
+        "ai_answer": result["final_answer"]
     }
 
 @app.get("/")
 def read_root():
-    return {"status": "Aegis-Sentinel is running", "system": "Multi-Agent RAG + MCP Ready"}
+    return {"status": "Aegis-Sentinel is running", "system": "Multi-Agent RAG + MCP + LangGraph"}
