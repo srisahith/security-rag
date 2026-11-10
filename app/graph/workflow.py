@@ -77,7 +77,6 @@ def output_guardrail_node(state: AgentState):
         return {"blocked": True, "final_answer": f"⚠️ Response blocked by Output Guardrail: {reason}"}
     return {"blocked": False}
 
-
 def finalize_node(state: AgentState):
     if state.get("error"):
         return {"final_answer": state["final_answer"]}
@@ -85,12 +84,12 @@ def finalize_node(state: AgentState):
     context = state.get('context', 'N/A')
     remediation = state.get('remediation_plan', 'N/A')
     
-    # 🚨 If the output guardrail blocked the answer, refuse cleanly
-    if state.get("blocked"):
+    # 🚨 Only show the "I don't know" message if the CONTEXT is empty
+    if "No relevant threat intel found" in context or not context.strip():
         answer = "⚠️ I don't know based on the current threat intel. The requested information is not in the database."
-    # 🚨 If the LLM refused, show a clean refusal
-    elif "i don't know" in remediation.lower() or "not enough information" in remediation.lower():
-        answer = f"### Threat Intel\n{context}\n\n### Remediation\n⚠️ The AI could not generate a remediation plan because the context did not contain enough information."
+    elif "i don't know" in remediation.lower() and len(context) > 100:
+        # If the LLM refused but the context is rich, use the context anyway
+        answer = f"### Threat Intel\n{context}\n\n### Remediation\n⚠️ The AI could not generate a remediation plan, but the threat intel above is available."
     else:
         answer = f"### Threat Intel\n{context}\n\n### Remediation\n{remediation}"
     

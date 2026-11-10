@@ -25,58 +25,47 @@ def extract_ids(question: str) -> list[str]:
                 if year.isdigit() and len(year) == 4 and cid.isdigit() and 4 <= len(cid) <= 7:
                     found_ids.append(f"{tokens[i]}-{year}-{cid}")
     return list(set(found_ids))
-
 @mcp.tool()
 def search_cve(question: str) -> str:
-    """
-    Search the local CISA/NVD threat intel database.
-    Use this tool whenever the user asks about a vulnerability, CVE, VDB, or threat.
-    """
-    print(f"[MCP TOOL] Searching DB for: {question}")
+    """Search the local threat intel database for vulnerabilities."""
+    print(f"[MCP TOOL] Searching for: {question}")
     
     conn = psycopg2.connect(os.getenv("DATABASE_URL"))
     cur = conn.cursor()
     register_vector(conn)
     
     try:
-        # 1. Extract IDs (CVE-2024-1234, VDB-249838, etc.)
+        # 1. Extract IDs (CVE-2024-1234, VDB-249838, or bare numbers like 88775)
         found_ids = extract_ids(question)
-        print(f"[MCP TOOL] Extracted IDs: {found_ids}")
         
-        # 2. Build SQL
-        sql_query = "SELECT content FROM lake_children WHERE 1=1"
-        params = []
-        
-        # 🚨 EXACT ID BOOSTING
+        # 🚨 2. STRICT ID MODE: If an ID is provided, ONLY do exact match
         if found_ids:
             boost_conditions = " OR ".join(["content ILIKE %s"] * len(found_ids))
-            sql_query += f" AND ({boost_conditions})"
-            for cve in found_ids:
-                params.append(f"%{cve}%")
+            sql_query = f"SELECT content FROM lake_children WHERE ({boost_conditions}) LIMIT 3;"
+            params = [f"%{cve}%" for cve in found_ids]
+            
+            cur.execute(sql_query, tuple(params))
+            results = cur.fetchall()
+            
+            if not results:
+                # 🚨 ID provided but not found → Refuse
+                return "No relevant threat intel found for the requested ID. The requested information is not in the database."
+            
+            return "\n\n---\n\n".join([row[0] for row in results])
         
-        # 3. Vector Search
+        # 3. NO ID → Fallback to Vector Search (semantic questions)
         query_embedding = client.embeddings(model="nomic-embed-text", prompt=question)["embedding"]
-        sql_query += " ORDER BY embedding <=> %s::vector LIMIT 3;"
-        params.append(query_embedding)
-        
-        cur.execute(sql_query, tuple(params))
+        sql_query = "SELECT content FROM lake_children ORDER BY embedding <=> %s::vector LIMIT 3;"
+        cur.execute(sql_query, (query_embedding,))
         results = cur.fetchall()
         
         if not results:
-            return "No relevant threat intel found in the database."
+            return "No relevant threat intel found."
             
-        # 4. Return context
-        context = "\n\n---\n\n".join([row[0] for row in results])
-        print(f"[MCP TOOL] Returning {len(results)} chunks to the agent.")
-        return context
+        return "\n\n---\n\n".join([row[0] for row in results])
         
     except Exception as e:
-        print(f"[MCP ERROR] {e}")
         return f"Database error: {e}"
     finally:
         cur.close()
         conn.close()
-
-if __name__ == "__main__":
-    print("Starting ThreatIntel MCP Server...")
-    mcp.run()
