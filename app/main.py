@@ -3,147 +3,137 @@ import re
 import json
 import redis
 import psycopg2
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from pgvector.psycopg2 import register_vector
 from ollama import Client
 from flashrank import Ranker, RerankRequest
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from datetime import datetime, timedelta
 
-# --- 1. OBSERVABILITY IMPORTS ---
+# --- 1. OBSERVABILITY & CELERY ---
 from prometheus_fastapi_instrumentator import Instrumentator
 from langfuse import Langfuse
-
-# --- 2. CELERY IMPORTS ---
 from app.workers import process_data_lake_task
+from app.agents.soc_agents import triage_agent, remediation_agent
 
-# --- 3. SETUP ---
+# --- 2. SETUP ---
+SECRET_KEY = "super-secret-aegis-key-change-in-prod"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
 app = FastAPI(title="Aegis-Sentinel API")
 Instrumentator().instrument(app).expose(app)
-
-# Initialize Langfuse (v2 syntax for your v2.95.11 server)
 langfuse = Langfuse()
 
-# Initialize Redis for Caching
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"))
 
-# --- 4. AI CLIENTS SETUP ---
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/token")
+
+# 🚨 TEMPORARY PLAIN-TEXT USER (Bypasses bcrypt issues for testing)
+fake_users_db = {
+    "admin": {
+        "username": "admin",
+        "password": "password123", 
+    }
+}
+
+# AI Clients
 OLLAMA_HOST = os.getenv("OLLAMA_URL", "http://host.docker.internal:11434")
 client = Client(host=OLLAMA_HOST)
-
-print("[RERANK] Loading FlashRank model...")
 ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="/tmp")
 
-# --- 5. REQUEST MODELS ---
+# --- 3. REQUEST MODELS ---
 class RAGRequest(BaseModel):
     question: str
     source_filter: str | None = None
     days_back: int | None = None
 
-# --- 6. MULTI-LAYER CVE EXTRACTOR ---
-def extract_cve_ids(question: str) -> list[str]:
-    found_cves = []
-    # Aggressive Normalization: Uppercase, replace non-alphanumeric with spaces
-    clean_q = "".join([c if c.isalnum() else " " for c in question]).upper()
-    tokens = clean_q.split()
-    
-    for i in range(len(tokens)):
-        if tokens[i] == "CVE":
-            if i + 2 < len(tokens):
-                year, cid = tokens[i+1], tokens[i+2]
-                if year.isdigit() and len(year) == 4 and cid.isdigit() and 4 <= len(cid) <= 7:
-                    found_cves.append(f"CVE-{year}-{cid}")
-            elif i + 1 < len(tokens):
-                next_token = tokens[i+1]
-                if len(next_token) >= 8 and next_token[:4].isdigit() and next_token[4:].isdigit():
-                    found_cves.append(f"CVE-{next_token[:4]}-{next_token[4:]}")
-                    
-    # Fallback for bare numbers (e.g., 2024-0293) if "CVE" is missing
-    if not found_cves and "CVE" not in clean_q:
-        for i in range(len(tokens) - 1):
-            if tokens[i].isdigit() and len(tokens[i]) == 4 and tokens[i+1].isdigit() and 4 <= len(tokens[i+1]) <= 7:
-                if 2000 <= int(tokens[i]) <= 2030:
-                    found_cves.append(f"CVE-{tokens[i]}-{tokens[i+1]}")
-                    
-    return list(set(found_cves))
+# --- 4. AUTH HELPERS ---
+def verify_password(plain_password, stored_password):
+    return plain_password == stored_password
 
-# --- 7. API ENDPOINTS ---
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=401, detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        return username
+    except JWTError:
+        raise credentials_exception
+
+# --- 5. ENDPOINTS ---
+
+@app.post("/api/token")
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = fake_users_db.get(form_data.username)
+    if not user or not verify_password(form_data.password, user["password"]):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    access_token = create_access_token(data={"sub": user["username"]})
+    return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/api/ingest")
-def trigger_ingestion():
+def trigger_ingestion(current_user: str = Depends(get_current_user)):
     task = process_data_lake_task.delay()
-    return {"message": "Ingestion started in background", "task_id": task.id}
+    return {"message": "Ingestion started", "task_id": task.id}
 
 @app.post("/api/ask")
-def ask_threat_intel(request: RAGRequest):
-    # 1. CHECK REDIS CACHE
-    cache_key = f"rag:{request.question}:{request.source_filter}:{request.days_back}"
+@limiter.limit("10/minute")
+def ask_threat_intel(request: Request, rag_request: RAGRequest, current_user: str = Depends(get_current_user)):
+    cache_key = f"rag:{rag_request.question}:{rag_request.source_filter}:{rag_request.days_back}"
     cached_result = redis_client.get(cache_key)
     if cached_result:
         return json.loads(cached_result)
 
-    # 2. START LANGFUSE TRACE
-    trace = langfuse.trace(name="RAG_Query", input={"question": request.question})
-    
+    trace = langfuse.trace(name="RAG_Query", input={"question": rag_request.question})
     conn = psycopg2.connect(os.getenv("DATABASE_URL"))
     cur = conn.cursor()
     register_vector(conn)
     
     try:
-        # 3. Extract CVEs
-        found_cves = extract_cve_ids(request.question)
+        # 🚨 1. CLEAN THE QUERY (Remove fluff, keep alphanumeric and hyphens)
+        clean_query = re.sub(r'[^A-Za-z0-9\-]', ' ', rag_request.question).strip()
         
-        # 4. BUILD BASE SQL
+        # 🚨 2. BUILD SQL
         sql_query = "SELECT content FROM lake_children WHERE 1=1"
         params = []
         
-        if request.source_filter:
+        if rag_request.source_filter:
             sql_query += " AND source = %s "
-            params.append(request.source_filter)
+            params.append(rag_request.source_filter)
             
-        if request.days_back:
-            sql_query += f" AND created_at >= NOW() - INTERVAL '{request.days_back} days' "
-
-        # 🚨 5. BRANCH 1: EXACT CVE MATCH (Direct DB Return, No LLM)
-        if found_cves:
-            boost_conditions = " OR ".join(["content ILIKE %s"] * len(found_cves))
-            sql_query += f" AND ({boost_conditions}) LIMIT 1;"
+        if rag_request.days_back:
+            sql_query += f" AND created_at >= NOW() - INTERVAL '{rag_request.days_back} days' "
             
-            for cve in found_cves:
-                params.append(f"%{cve}%")
-                
-            cur.execute(sql_query, tuple(params))
-            exact_match = cur.fetchone()
+        # 🚨 3. EXACT MATCH BYPASS (If the query has a hyphen and a number, it's an ID)
+        if "-" in clean_query and any(char.isdigit() for char in clean_query):
+            sql_query += " AND content ILIKE %s "
+            params.append(f"%{clean_query}%")
             
-            if exact_match:
-                context = exact_match[0]
-                # Clean up the enrichment header for a nicer output
-                final_answer = context.replace("[Source: NVD] ", "").strip()
-                
-                response_data = {
-                    "question": request.question,
-                    "answer_type": "Exact CVE Match (Database)",
-                    "context_snippet": context[:300] + "...",
-                    "ai_answer": final_answer
-                }
-                redis_client.setex(cache_key, 3600, json.dumps(response_data))
-                langfuse.flush()
-                return response_data
-
-        # 🚨 6. BRANCH 2: CONCEPTUAL QUERY (Vector Search + LLM Reasoning)
-        query_embedding = client.embeddings(model="nomic-embed-text", prompt=request.question)["embedding"]
-        
-        # Rebuild query for vector search
-        sql_query = "SELECT content FROM lake_children WHERE 1=1"
-        params = []
-        
-        if request.source_filter:
-            sql_query += " AND source = %s "
-            params.append(request.source_filter)
-            
-        if request.days_back:
-            sql_query += f" AND created_at >= NOW() - INTERVAL '{request.days_back} days' "
-            
-        sql_query += " ORDER BY embedding <=> %s::vector LIMIT 5;"
+        # 🚨 4. Add Vector Search as fallback
+        query_embedding = client.embeddings(model="nomic-embed-text", prompt=rag_request.question)["embedding"]
+        sql_query += " ORDER BY embedding <=> %s::vector LIMIT 3;"
         params.append(query_embedding)
         
         cur.execute(sql_query, tuple(params))
@@ -152,76 +142,124 @@ def ask_threat_intel(request: RAGRequest):
         if not results:
             context = "No relevant threat intel found."
         else:
-            # Rerank for better precision
-            passages = [{"id": i, "text": row[0]} for i, row in enumerate(results)]
-            rerank_request = RerankRequest(query=request.question, passages=passages)
-            reranked_results = ranker.rerank(rerank_request)
-            
-            # Take top 3 chunks
-            top_chunks = [res["text"] for res in reranked_results[:3]]
-            context = "\n\n---\n\n".join(top_chunks)
+            context = "\n\n---\n\n".join([row[0] for row in results])
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
     finally:
         cur.close()
         conn.close()
 
-    # 7. LLM REASONING (Only for conceptual queries)
-    system_prompt = f"""You are an expert Cyber Security Analyst AI. 
-    You have been given raw threat intelligence data. Your job is to analyze it and answer the user's question.
-    
-    RAW DATA FROM DATABASE:
-    {context}
-    
-    INSTRUCTIONS:
-    - Answer the question using ONLY the raw data provided.
-    - If the user asks to compare vulnerabilities, identify the differences in severity or impact.
-    - If the user asks for a remediation plan, generate a step-by-step fix based on the descriptions.
-    - If the answer is not in the data, say "I don't know based on the current threat intel."
-    - Do NOT just repeat the raw data. Synthesize it into a clear, professional answer.
-    """
-    
+    # 5. LLM Reasoning
+    system_prompt = f"""You are a Cyber Security AI. Answer using ONLY this context: {context}"""
     try:
         response = client.chat(
             model="qwen2.5:1.5b",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": request.question}
-            ]
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": rag_request.question}]
         )
         answer = response['message']['content'].strip()
-        
-        generation = trace.generation(
-            name="LLM_Reasoning",
-            model="qwen2.5:1.5b",
-            input=system_prompt,
-            output=answer
-        )
-        
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM error: {e}")
 
-    # 8. SAVE TO CACHE
     response_data = {
-        "question": request.question,
-        "source_filter": request.source_filter or "All Sources",
-        "days_back": request.days_back or "All Time",
-        "answer_type": "LLM Reasoning (RAG)",
+        "question": rag_request.question,
+        "answer_type": "LLM Reasoning",
         "context_snippet": context[:300] + "...",
         "ai_answer": answer
     }
     redis_client.setex(cache_key, 3600, json.dumps(response_data))
     langfuse.flush()
-
     return response_data
 
-@app.post("/api/scan")
-def start_scan(target_url: str):
-    from app.workers import trigger_dast_scan
-    task = trigger_dast_scan.delay(target_url)
-    return {"message": "DAST scan started in the background", "task_id": task.id}
+@app.post("/api/agent")
+@limiter.limit("5/minute")
+def agentic_workflow(request: Request, rag_request: RAGRequest, current_user: str = Depends(get_current_user)):
+    trace = langfuse.trace(name="Multi_Agent_Workflow", input={"question": rag_request.question})
+    
+    # 1. Triage Agent
+    decision = triage_agent(rag_request.question)
+    print(f"[AGENT] Triage Decision: {decision}")
+    trace.span(name="Triage_Agent", output=json.dumps(decision)).end()
+    
+    context = "No threat intel requested."
+    remediation_plan = "No remediation requested."
+    
+    # 2. Threat Intel Agent (SQL Search)
+        # 2. Threat Intel Agent (SQL Search)
+        # 2. Threat Intel Agent (SQL Search)
+    if decision.get("needs_search", True):
+        print(f"[AGENT] Performing SQL search for: {rag_request.question}")
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur = conn.cursor()
+        register_vector(conn)
+        try:
+            # 🚨 1. Extract just the ID using a simple split
+            # This handles "what is VDB-249838" -> "VDB-249838"
+            clean_query = ""
+            for word in rag_request.question.split():
+                if "-" in word and any(char.isdigit() for char in word):
+                    clean_query = word.strip("?.,;:")
+                    break
+            
+            if not clean_query:
+                # If no ID found, just use the whole question for vector search
+                clean_query = rag_request.question
+                
+            print(f"[AGENT] Clean query: {clean_query}")
+            
+            # 🚨 2. Build the SQL
+            sql_query = "SELECT content FROM lake_children WHERE 1=1"
+            params = []
+            
+            if rag_request.source_filter:
+                sql_query += " AND source = %s "
+                params.append(rag_request.source_filter)
+                
+            # 🚨 3. If it looks like an ID, force the exact match
+            if "-" in clean_query and any(char.isdigit() for char in clean_query):
+                sql_query += " AND content ILIKE %s "
+                params.append(f"%{clean_query}%")
+                print(f"[AGENT] Added ILIKE filter: %{clean_query}%")
+                
+            # 🚨 4. Add the vector search
+            query_embedding = client.embeddings(model="nomic-embed-text", prompt=rag_request.question)["embedding"]
+            sql_query += " ORDER BY embedding <=> %s::vector LIMIT 3;"
+            params.append(query_embedding)
+            
+            print(f"[AGENT] SQL: {sql_query}")
+            cur.execute(sql_query, tuple(params))
+            results = cur.fetchall()
+            print(f"[AGENT] Found {len(results)} results.")
+            
+            if results:
+                context = "\n\n---\n\n".join([row[0] for row in results])
+            else:
+                context = "No results found in database for this query."
+                
+        except Exception as e:
+            print(f"[AGENT ERROR] {e}")
+            context = f"Database error: {e}"
+        finally:
+            cur.close()
+            conn.close()
+    # 3. Remediation Agent
+    if decision.get("needs_remediation", False) and context != "No threat intel requested.":
+        remediation_plan = remediation_agent(context)
+        trace.span(name="Remediation_Agent", output=remediation_plan[:500]).end()
+
+    # 4. Final Synthesis
+    final_answer = f"### Threat Intel Analysis\n{context}\n\n### Remediation Plan\n{remediation_plan}"
+    
+    langfuse.flush()
+    
+    return {
+        "question": rag_request.question,
+        "triage_decision": decision,
+        "context_snippet": context[:300] + "...",
+        "remediation_plan": remediation_plan,
+        "ai_answer": final_answer
+    }
 
 @app.get("/")
 def read_root():
-    return {"status": "Aegis-Sentinel is running", "system": "AI DAST + IRIS + Hybrid RAG"}
+    return {"status": "Aegis-Sentinel is running", "system": "Multi-Agent RAG + MCP Ready"}

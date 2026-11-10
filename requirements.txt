@@ -17,3 +17,9 @@ tiktoken
 prometheus-fastapi-instrumentator
 langfuse<3.0.0
 feedparser
+mcp
+python-jose[cryptography]
+bcrypt==4.0.1
+passlib[bcrypt]
+slowapi
+python-multipart
